@@ -1,3 +1,4 @@
+#	include <math.h>
 /************************************************************************
 	SYRO for volca sample
       Example 
@@ -554,6 +555,125 @@ static void free_syrodata(SyroData *syro_data, int num_of_data)
 	}
 }
 
+#define NZEROS 4
+#define NPOLES 4
+#define GAIN   9.794817390e+01
+
+typedef struct State State;
+struct State {
+	double xv[NZEROS+1], yv[NPOLES+1];
+};
+
+static double filter(State *state, double input) {
+        state->xv[0] = state->xv[1]; state->xv[1] = state->xv[2]; state->xv[2] = state->xv[3]; state->xv[3] = state->xv[4];
+        state->xv[4] = input / GAIN;
+        state->yv[0] = state->yv[1]; state->yv[1] = state->yv[2]; state->yv[2] = state->yv[3]; state->yv[3] = state->yv[4];
+        state->yv[4] =   (state->xv[0] + state->xv[4]) + 4 * (state->xv[1] + state->xv[3]) + 6 * state->xv[2]
+                     + ( -0.1203895999 * state->yv[0]) + (  0.7244708295 * state->yv[1])
+                     + ( -1.7358607092 * state->yv[2]) + (  1.9684277869 * state->yv[3]);
+        return state->yv[4];
+  }
+
+typedef struct Detector Detector;
+struct Detector {
+	int count;
+	int phases[4];
+	double avg;
+};
+
+static void
+detector(Detector *det, int quad, double cur_mag)
+{
+	det->phases[quad]++;
+	det->count++;
+
+	if (det->count >= 8) {
+		int mp = 0;
+		for (int i=0; i<4; i++) {
+			if (det->phases[i] >= 4) {
+				printf("major phase %d avg=%lf\n", i, cur_mag);
+				mp++;
+			}
+		}
+		if (mp == 0)
+			printf("no major phases found %d %d %d %d\n", det->phases[0], det->phases[1], det->phases[2], det->phases[3]);
+		if (mp > 1)
+			printf("multiple phases found %d %d %d %d\n", det->phases[0], det->phases[1], det->phases[2], det->phases[3]);
+cleanup:
+		memset(det, 0, sizeof(*det));
+	}
+}
+
+static int counter = 0;
+static double phase;
+static State i_filter, q_filter;
+static Detector det = {.count=0};
+static double mavg[32];
+static int mptr;
+static int synced = 0;
+static int frames = 0;
+
+static void post_process(double in, double *out1, double *out2)
+{
+	//in = random() / (double) RAND_MAX - 0.5;
+	double i = in * cos(phase);
+	double q = in * sin(phase);
+	phase += M_PI/4;
+	double i_f = filter(&i_filter, i);
+	double q_f = filter(&q_filter, q);
+	frames++;
+
+	if (!synced) {
+		double signal_phase = fabs(atan2(q_f, i_f));
+		int small_enough = signal_phase < 0.01;
+		printf("sp=%lf small=%d\n", signal_phase, small_enough);
+
+		if (small_enough) {
+			if (frames > 100) {
+				synced = 1;
+				printf("synced! \n");
+			}
+		}
+
+		*out1 = in;
+		*out2 = cos(phase);
+		phase -= fabs(signal_phase)*0.001;
+		return;
+	}
+
+	i = i_f;
+	q = q_f;
+	//*out1 = sqrt(i*i + q*q);
+	//*out2 = fmod(atan2(q, i) + 2*M_PI, 2*M_PI) / (2 * M_PI) / 1.1;
+
+	// [1; 0] -> [sq2, sq2]
+	// [0; 1] -> [-sq2, sq2]
+	double sq2 = sqrt(2) / 2.0;
+	double r_i = i * sq2 - q * sq2;
+	double r_q = i * sq2 + q * sq2;
+
+	i = r_i;
+	q = r_q;
+
+	double mag = sqrt(i*i + q*q);
+	int quadrant = (q < 0.0 ? 2 : 0) + (i < 0.0 ? 1 : 0);
+
+	mavg[mptr] = mag;
+	mptr = (mptr + 1) % 32;
+	double avg_now = 0.0;
+	for (int k = 0; k < 8; k++)
+		avg_now += mavg[(mptr + 29 - k) % 32];
+	double cur_mag = avg_now / 8.0;
+
+	detector(&det, quadrant, cur_mag);
+
+	*out1 = cur_mag;
+	//*out1 = mag;
+	*out2 = quadrant / 4.0;
+	//*out1 = i;
+	//*out2 = q;
+}
+
 
 /*****************************************************************************
 	Main
@@ -609,6 +729,12 @@ static int main2(int argc, char **argv)
 	write_pos = sizeof(wav_header);
 	while (frame) {
 		SyroVolcaSample_GetSample(handle, &left, &right);
+		double new_left, new_right;
+		post_process(left / 32767.0, &new_left, &new_right);
+
+		//left = new_left * 32767.0;
+		//right = new_right * 32767.0;
+
 		buf_dest[write_pos++] = (uint8_t)left;
 		buf_dest[write_pos++] = (uint8_t)(left >> 8);
 		buf_dest[write_pos++] = (uint8_t)right;

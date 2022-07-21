@@ -1,0 +1,4 @@
+p p v
+    ^ 1 volume 16/24
+      0 volume 4/24
+^ ^ phase (00 sin, 01 cos, 10, -sin, 11 -cos)
